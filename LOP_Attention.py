@@ -12,13 +12,14 @@ class LOP_Adaptive(nn.Module):
      - Với mỗi head lấy một slice trung tâm của conv.weight để mô phỏng kernel size k <= max_k.
      - Kernel động k được suy ra từ attention importance (trên batch).
     """
-    def __init__(self, input_dim, output_dim, num_heads, min_kernel, max_kernel):
+    def __init__(self, input_dim, output_dim, num_heads, min_kernel, max_kernel,diff = False):
         super().__init__()
         assert output_dim % num_heads == 0, "output_dim must be divisible by num_heads"
         self.num_heads = num_heads
         self.head_dim = output_dim // num_heads
         self.scale = self.head_dim ** -0.5
         self.last_attn = None  # thêm dòng này
+        self.diff = diff
 
 
         # Projection
@@ -98,10 +99,16 @@ class LOP_Adaptive(nn.Module):
         imp_scaled = self.kernel_proj(imp_norm)  # (H,1)
         frac = torch.sigmoid(imp_scaled).squeeze(-1)  # (H,)
         kernel_range = (self.max_kernel - self.min_kernel)
-        k_values = (self.min_kernel + (frac * kernel_range)).round().to(torch.int64)  # (H,)
+        if self.diff:
+            k_float = self.min_kernel + (frac * kernel_range)
+            k_round = torch.round(k_float)
+            k_values = k_round + (k_float - k_round).detach()  # STE trick
+        else:
+            k_values = (self.min_kernel + (frac * kernel_range)).round()
+
+        # enforce odd kernels
         k_values = k_values + (1 - (k_values % 2))
         k_values = torch.clamp(k_values, min=self.min_kernel, max=self.max_kernel)
-
         out = torch.matmul(attn, v)  # (B, H, T, d)
 
         conv_outs = []
@@ -145,7 +152,8 @@ class LOP_Attention(nn.Module):
             output_dim=input_dim,
             num_heads=num_heads,
             min_kernel=min_kernel,
-            max_kernel=max_kernel
+            max_kernel=max_kernel,
+            diff = True
         )
 
         # Feedforward block chuẩn Transformer
