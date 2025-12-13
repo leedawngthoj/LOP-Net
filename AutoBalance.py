@@ -1,4 +1,4 @@
-
+# DataBalance (clean, no leakage)
 from imblearn.combine import SMOTEENN
 from imblearn.over_sampling import SMOTE, ADASYN, RandomOverSampler
 from sklearn.model_selection import train_test_split
@@ -8,7 +8,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-class AutoBalance:
+from bayes_opt import BayesianOptimization
+
+class DataBalance:
     """
     Auto-select an oversampling strategy and sampling ratio for a given training set,
     WITHOUT causing data leakage.
@@ -18,7 +20,7 @@ class AutoBalance:
         X_res, y_res = balancer.auto_select()
     """
 
-    def __init__(self, X_train, y_train, threshold=0.7, random_state=99, verbose=True):
+    def __init__(self, X_train, y_train, threshold=0.7, random_state=99, scale_inside = True, verbose=True):
         # Accept pandas or numpy
         self.X_train = X_train.values if hasattr(X_train, "values") else np.asarray(X_train)
         self.y_train = y_train.values if hasattr(y_train, "values") else np.asarray(y_train)
@@ -29,6 +31,7 @@ class AutoBalance:
         self.best_strategy = None
         self.results = {}   # store (method -> (best_strategy, best_score))
         self.verbose = verbose
+        self.scale_inside = scale_inside
 
     def imbalance_ratio(self):
         counts = np.bincount(self.y_train.astype(int))
@@ -87,8 +90,10 @@ class AutoBalance:
         """
         Correct evaluation WITHOUT leakage:
         1) Split (X,y) into inner train / val
-        3) Apply sampler.fit_resample on scaled inner-train
-        4) Train MLP on resampled-scaled inner-train, evaluate on scaled val (val untouched by resampling)
+        2) Fit scaler on inner-train (ONLY)
+        3) Transform inner-train and val
+        4) Apply sampler.fit_resample on scaled inner-train
+        5) Train MLP on resampled-scaled inner-train, evaluate on scaled val (val untouched by resampling)
         Returns f1 (float).
         """
         # 1) split BEFORE any resampling
@@ -97,7 +102,12 @@ class AutoBalance:
         )
 
         # 2) scale: fit on X_tr only
-        X_tr_s, X_val_s = X_tr, X_val
+        if self.scale_inside:
+            scaler = StandardScaler()
+            X_tr_s = scaler.fit_transform(X_tr)
+            X_val_s = scaler.transform(X_val)
+        else:
+            X_tr_s, X_val_s = X_tr, X_val
 
         # 3) apply sampler only on the training partition (scaled)
         try:
@@ -190,6 +200,36 @@ class AutoBalance:
 
         return best_ratio, best_score
 
+    def bayesian_optimize_strategy(self, method, init_points=4, n_iter=12):
+        """
+        Optimize sampling_strategy in [0.5, 1.0] using Bayesian Optimization.
+        Returns best_strategy (float).
+        """
+
+        def objective(ratio):
+
+            val = self.evaluate_balance(self.X_train, self.y_train, method, ratio)
+            return float(val)
+
+        pbounds = { "ratio": (0.5, 0.9) }
+
+        optimizer = BayesianOptimization(
+            f=objective,
+            pbounds=pbounds,
+            random_state=self.random_state,
+            verbose=0
+        )
+
+        optimizer.maximize(init_points=init_points, n_iter=n_iter)
+
+        best_ratio = optimizer.max["params"]["ratio"]
+        best_score = optimizer.max["target"]
+
+        if self.verbose:
+            print(f"[BayesOpt] Best ratio = {best_ratio:.4f} | score = {best_score:.4f}")
+
+        return best_ratio, best_score
+
     def auto_select(self):
         """
         Main entry: search across candidate methods and pick the best method+strategy.
@@ -229,11 +269,39 @@ class AutoBalance:
             print(f"Best method: {self.best_method} (strategy={self.best_strategy}) | validation F1={self.best_score:.4f}")
 
         # Apply chosen sampler to the ORIGINAL training data (unscaled) to produce final X_res, y_res
+        # Apply chosen sampler to ORIGINAL data
         final_sampler = self.candidate_methods()[self.best_method]
+
         try:
             if self.best_method != "SMOTEENN" and self.best_strategy not in (None, 'auto'):
                 final_sampler = final_sampler.set_params(sampling_strategy=self.best_strategy)
+
             X_res, y_res = final_sampler.fit_resample(self.X_train, self.y_train)
+
+            # ======== NEW: CHECK IMBALANCE AFTER RESAMPLING ========
+            counts = np.bincount(y_res.astype(int))
+            minority = min(counts)
+            majority = max(counts)
+
+            imbalance_ratio = minority / majority
+            if imbalance_ratio < 0.80:   # nghĩa là majority > minority * 1.25
+                if self.verbose:
+                    print(f"Post-resample imbalance detected: ratio={imbalance_ratio:.3f}. Switching to Bayesian Optimization...")
+
+                # Re-run Bayesian optimization to find best sampling ratio
+                method_instance = self.candidate_methods()[self.best_method]
+                new_ratio, new_score = self.bayesian_optimize_strategy(method_instance)
+
+                # Apply again using optimized ratio
+                sampler_opt = method_instance.set_params(sampling_strategy=new_ratio)
+                X_res, y_res = sampler_opt.fit_resample(self.X_train, self.y_train)
+
+                if self.verbose:
+                    print(f"Updated strategy from {self.best_strategy} → {new_ratio:.4f} (BayesOpt)")
+
+                self.best_strategy = new_ratio
+                self.best_score = new_score
+
         except Exception as e:
             if self.verbose:
                 print(f"[auto_select] Final resampling failed ({e}). Returning original data.")
