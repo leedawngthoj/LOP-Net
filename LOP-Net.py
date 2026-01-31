@@ -4,41 +4,54 @@ import torch.nn.functional as F
 from LOP_Attention import LOP_Attention
 from Relationship_LSTM import Relationship_LSTM
 class LOP_Net(nn.Module):
-    def __init__(self, input_dim, embed_dim=128, num_heads=4, ff_dim=64, rnn_hidden=128):
+    def __init__(
+        self,
+        input_dim,
+        embed_dim=128,
+        num_heads=4,
+        ff_dim=64,
+        rnn_hidden=128,
+        dropout=0.01,
+        fixed_radius=None 
+    ):
         super().__init__()
-        self.embed_dim = embed_dim
-        
-        # Embedding layer
+
         self.embedding = nn.Linear(input_dim, embed_dim)
 
-        self.transformer = LOP_Attention(embed_dim, num_heads, ff_dim, dropout =0.3, min_kernel =3, max_kernel=11)
-
-        # Bi-directional Relationship LSTM
-        self.rnn = Relationship_LSTM(embed_dim, rnn_hidden)
-
-        # LayerNorm cuối trước khi FC
-        self.norm_final = nn.LayerNorm(rnn_hidden * 2)
-
-        # Fully connected output
-        self.fc = nn.Sequential(
-            nn.Linear(rnn_hidden * 2, 32),
-            nn.ReLU(),
-            nn.Linear(32, 1)
+        # LOP_Attention block
+        self.lop_attention = LOP_Attention(
+            dim=embed_dim,
+            num_heads=num_heads,
+            ff_dim=ff_dim,
+            dropout=dropout,
+            fixed_radius=fixed_radius
         )
 
-    def forward(self, x):
-        # Embedding
-        x = self.embedding(x)  # [B, T, embed_dim]
+        # Relationship LSTM block
+        self.relationship_lstm = Relationship_LSTM(embed_dim, rnn_hidden)
 
-        # MultiHeadConvAttention block
-        x, attn = self.transformer(x, return_attn=True)
+        self.norm = nn.LayerNorm(rnn_hidden * 2)
+        self.fc = nn.Sequential(
+            nn.Linear(rnn_hidden * 2, 64),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(64, 1)
+        )
 
-        # Bi-directional Relationship LSTM
-        _, (h, _) = self.rnn(x)
-        h = self.norm_final(h)
+    def forward(self, x, return_internal=False):
+        x = self.embedding(x)
+        x, _ = self.lop_attention(x, return_attn=True)
 
-        # FC output
-        out = self.fc(h)
-        return out
+        out, (h, _), r_f, r_b, ck_f, ca_f = self.relationship_lstm(x)
+        h = self.norm(h)
+        logits = self.fc(h)
 
+        if return_internal:
+            return logits, {
+                "r_f": r_f,
+                "r_b": r_b,
+                "c_keep": ck_f,
+                "c_add": ca_f
+            }
 
+        return logits
