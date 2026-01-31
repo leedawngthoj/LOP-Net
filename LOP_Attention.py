@@ -4,180 +4,189 @@ import torch.nn.functional as F
 
 class LOP_Adaptive(nn.Module):
     """
-    Multi-head attention + head-wise Conv1d với:
-     - kernel_size động theo importance của head
-     - smart padding (edge replication) để giảm edge artifacts
-    Ý tưởng:
-     - Tạo conv kernel với kích thước tối đa max_k.
-     - Với mỗi head lấy một slice trung tâm của conv.weight để mô phỏng kernel size k <= max_k.
-     - Kernel động k được suy ra từ attention importance (trên batch).
+    Multi-head self-attention + head-wise Conv1D
+    with fully learnable, continuous receptive field per head.
+    (Gaussian soft mask – stable gradient)
     """
-    def __init__(self, input_dim, output_dim, num_heads, min_kernel, max_kernel,diff = False):
+    def __init__(
+        self,
+        input_dim,
+        output_dim,
+        num_heads,
+        min_kernel=3,
+        max_kernel=11,
+        sigma=1.5,
+        fixed_radius=None
+    ):
         super().__init__()
-        assert output_dim % num_heads == 0, "output_dim must be divisible by num_heads"
+        assert output_dim % num_heads == 0
+        assert min_kernel % 2 == 1 and max_kernel % 2 == 1
+
         self.num_heads = num_heads
         self.head_dim = output_dim // num_heads
         self.scale = self.head_dim ** -0.5
-        self.last_attn = None  # thêm dòng này
-        self.diff = diff
 
+        self.min_kernel = min_kernel
+        self.max_kernel = max_kernel
+        self.max_radius = max_kernel // 2
+        self.sigma = sigma
 
-        # Projection
+        # QKV projections
         self.q = nn.Linear(input_dim, output_dim)
         self.k = nn.Linear(input_dim, output_dim)
         self.v = nn.Linear(input_dim, output_dim)
 
-    
-        self.max_kernel = max_kernel if max_kernel % 2 == 1 else max_kernel + 1  
-        self.min_kernel = min_kernel if min_kernel % 2 == 1 else min_kernel + 1
-        assert 1 <= self.min_kernel <= self.max_kernel, "min_kernel must be >=1 and <= max_kernel"
+        # 🔥 Learnable radius (continuous)
+        self.radius_param = nn.Parameter(
+            torch.linspace(
+                self.min_kernel // 2,
+                self.max_kernel // 2,
+                steps=num_heads
+            )
+        )
 
+        # Optional scaling (helps escaping clamp)
+        self.radius_scale = nn.Parameter(torch.ones(num_heads))
+        self.fixed_radius = fixed_radius
+
+        # Max-kernel conv per head
         self.convs = nn.ModuleList([
-            nn.Conv1d(self.head_dim, self.head_dim, kernel_size=self.max_kernel, padding=0, bias=True)
+            nn.Conv1d(
+                self.head_dim,
+                self.head_dim,
+                kernel_size=self.max_kernel,
+                padding=0,
+                bias=True
+            )
             for _ in range(num_heads)
         ])
-
-
-        self.kernel_proj = nn.Sequential(
-            nn.Linear(1, 16),
-            nn.ReLU(),
-            nn.Linear(16, 1)
-        )
 
         self.fc = nn.Linear(output_dim, output_dim)
         self.norm = nn.LayerNorm(output_dim)
 
+        # logging
+        self.last_k_values = None
+        self.last_radius = None
+        self.last_attn = None
+
     def _smart_pad(self, x, target_len):
-        """
-        Pad tensor x (B, C, L) to length target_len using edge replication.
-        If L >= target_len -> do nothing.
-        """
         B, C, L = x.shape
         if L >= target_len:
             return x
-        needed = target_len - L
-        left = needed // 2
-        right = needed - left
-        # replicate edges
-        left_pad = x[:, :, 0:1].repeat(1, 1, left) if left > 0 else torch.empty(B, C, 0, device=x.device, dtype=x.dtype)
-        right_pad = x[:, :, -1:].repeat(1, 1, right) if right > 0 else torch.empty(B, C, 0, device=x.device, dtype=x.dtype)
-        return torch.cat([left_pad, x, right_pad], dim=2)
+        pad = target_len - L
+        left = pad // 2
+        right = pad - left
+        left_pad = x[:, :, :1].repeat(1, 1, left)
+        right_pad = x[:, :, -1:].repeat(1, 1, right)
+        return torch.cat([left_pad, x, right_pad], dim=-1)
+   
+    def radius_diversity_loss(radius):
+        diff = radius.unsqueeze(0) - radius.unsqueeze(1)
+        return -torch.mean(diff ** 2)
 
-    def _central_slice(self, weight, k):
-        _, _, max_k = weight.shape
-        assert max_k >= k
-        center = max_k // 2
-        half = k // 2
-        start = center - half
-        end = center + half + 1
-        return weight[:, :, start:end]
 
-    def forward(self, x,return_attn=False):
+    def forward(self, x, return_attn=False):
         """
-        x: (B, T, input_dim)
-        returns: (B, T, output_dim)
+        x: (B, T, D)
         """
         B, T, _ = x.size()
-        # Linear projections and reshape into heads
-        q = self.q(x).view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # (B, H, T, d)
+
+        # ---- QKV ----
+        q = self.q(x).view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         k = self.k(x).view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         v = self.v(x).view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
-        # Attention scores
-        attn_logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale  # (B, H, T, T)
+        # ---- Attention ----
+        attn_logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         attn = F.softmax(attn_logits, dim=-1)
-
-
         self.last_attn = attn.detach().cpu()
-        importance = attn.mean(dim=(-2, -1))  # (B, H)
-        importance = importance.mean(dim=0, keepdim=True).transpose(0, 1)  # (H, 1)
-        # normalize to [0,1]
-        imp_min = importance.min()
-        imp_max = importance.max()
-        imp_norm = (importance - imp_min) / (imp_max - imp_min + 1e-6)  # (H,1)
 
-        imp_scaled = self.kernel_proj(imp_norm)  # (H,1)
-        frac = torch.sigmoid(imp_scaled).squeeze(-1)  # (H,)
-        kernel_range = (self.max_kernel - self.min_kernel)
-        if self.diff:
-            k_float = self.min_kernel + (frac * kernel_range)
-            k_round = torch.round(k_float)
-            k_values = k_round + (k_float - k_round).detach()  # STE trick
-        else:
-            k_values = (self.min_kernel + (frac * kernel_range)).round()
-
-        # enforce odd kernels
-        k_values = k_values + (1 - (k_values % 2))
-        k_values = torch.clamp(k_values, min=self.min_kernel, max=self.max_kernel)
         out = torch.matmul(attn, v)  # (B, H, T, d)
 
+        # ---- Kernel positions ----
+        center = self.max_kernel // 2
+        pos = torch.arange(self.max_kernel, device=x.device).float()
+        pos = (pos - center).abs()  # (K,)
+
         conv_outs = []
-        for i, conv in enumerate(self.convs):
-            k_i = int(k_values[i].item())  # desired kernel for head i (odd)
-            head = out[:, i].transpose(1, 2)  # (B, d, T)
-            head_padded = self._smart_pad(head, max(T, k_i))
-            w = conv.weight  # (out_ch=head_dim, in_ch=head_dim, max_k)
-            b = conv.bias
-            w_sliced = self._central_slice(w, k_i)  # (d, d, k_i)
-            head_conv = F.conv1d(head_padded, w_sliced, bias=b, padding=0, groups=1)
+        k_values = []
+        radius_values = []
 
-            L_out = head_conv.shape[-1]
-            if L_out > T:
-                start = (L_out - T) // 2
-                head_conv = head_conv[:, :, start:start + T]
-            elif L_out < T:
-                head_conv = self._smart_pad(head_conv, T)
-            head_out = head_conv.transpose(1, 2)
-            conv_outs.append(head_out)
+        for h in range(self.num_heads):
+            if self.fixed_radius is None:
+                r = self.radius_param[h] * self.radius_scale[h]
+            else:
+                r = torch.tensor(
+                    self.fixed_radius,
+                    device=x.device,
+                    dtype=torch.float32
+                )
 
-        out_cat = torch.cat(conv_outs, dim=-1)
-        out_proj = self.fc(out_cat)
-        out_proj = self.norm(out_proj + x)
+            r = torch.clamp(r, 0.0, float(self.max_radius))
+
+
+            # Gaussian soft mask (GOOD GRADIENT)
+            mask = torch.exp(- (pos - r) ** 2 / (2 * self.sigma ** 2))
+            mask = mask.view(1, 1, -1)
+
+            w = self.convs[h].weight * mask
+            b = self.convs[h].bias
+
+            head = out[:, h].transpose(1, 2)  # (B, d, T)
+            head = self._smart_pad(head, T + self.max_kernel)
+
+            y = F.conv1d(head, w, b)
+
+            start = (y.size(-1) - T) // 2
+            y = y[:, :, start:start + T]
+
+            conv_outs.append(y.transpose(1, 2))
+
+            # logging only
+            k_eff = 2 * torch.round(r).clamp(0, self.max_radius) + 1
+            k_values.append(k_eff)
+            radius_values.append(r)
+
+        self.last_k_values = torch.stack(k_values).detach().cpu()
+        self.last_radius = torch.stack(radius_values).detach().cpu()
+
+        out = torch.cat(conv_outs, dim=-1)
+        out = self.fc(out)
+        out = self.norm(out + x)
+
         if return_attn:
-            return out_proj, attn  # shape B x H x T x T
-        return out_proj
-
+            return out, attn
+        return out
 class LOP_Attention(nn.Module):
-    """
-    Transformer Encoder block sử dụng MultiHeadConvAttentionAdaptive + FeedForward.
-    Có residual connection và layer normalization.
-    """
-    def __init__(self, input_dim, num_heads, ff_dim, dropout,
-                 min_kernel, max_kernel):
+    def __init__(self, dim, num_heads, ff_dim, dropout=0.01,fixed_radius=None):
         super().__init__()
 
-        # Dùng attention có kernel động
         self.attn = LOP_Adaptive(
-            input_dim=input_dim,
-            output_dim=input_dim,
-            num_heads=num_heads,
-            min_kernel=min_kernel,
-            max_kernel=max_kernel,
-            diff = True
+            dim, dim, num_heads,
+            fixed_radius=fixed_radius
         )
 
-        # Feedforward block chuẩn Transformer
         self.ff = nn.Sequential(
-            nn.Linear(input_dim, ff_dim),
+            nn.Linear(dim, ff_dim),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(ff_dim, input_dim)
+            nn.Linear(ff_dim, dim)
         )
 
-        # LayerNorm + dropout
-        self.norm1 = nn.LayerNorm(input_dim)
-        self.norm2 = nn.LayerNorm(input_dim)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x, return_attn=False):
-        attn_out = self.attn(x, return_attn=return_attn)
         if return_attn:
-            out_attn = attn_out[1]
-            attn_out = attn_out[0]
-        x = self.norm1(x + self.dropout(attn_out))
+            y, attn = self.attn(x, return_attn=True)
+        else:
+            y = self.attn(x)
 
-        ff_out = self.ff(x)
-        x = self.norm2(x + self.dropout(ff_out))
+        x = self.norm1(x + self.dropout(y))
+        y = self.ff(x)
+        x = self.norm2(x + self.dropout(y))
+
         if return_attn:
-            return x, out_attn
+            return x, attn
         return x
