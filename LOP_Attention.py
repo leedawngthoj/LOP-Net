@@ -31,12 +31,10 @@ class LOP_Adaptive(nn.Module):
         self.max_radius = max_kernel // 2
         self.sigma = sigma
 
-        # QKV projections
         self.q = nn.Linear(input_dim, output_dim)
         self.k = nn.Linear(input_dim, output_dim)
         self.v = nn.Linear(input_dim, output_dim)
 
-        # 🔥 Learnable radius (continuous)
         self.radius_param = nn.Parameter(
             torch.linspace(
                 self.min_kernel // 2,
@@ -45,11 +43,8 @@ class LOP_Adaptive(nn.Module):
             )
         )
 
-        # Optional scaling (helps escaping clamp)
         self.radius_scale = nn.Parameter(torch.ones(num_heads))
         self.fixed_radius = fixed_radius
-
-        # Max-kernel conv per head
         self.convs = nn.ModuleList([
             nn.Conv1d(
                 self.head_dim,
@@ -64,7 +59,6 @@ class LOP_Adaptive(nn.Module):
         self.fc = nn.Linear(output_dim, output_dim)
         self.norm = nn.LayerNorm(output_dim)
 
-        # logging
         self.last_k_values = None
         self.last_radius = None
         self.last_attn = None
@@ -86,24 +80,17 @@ class LOP_Adaptive(nn.Module):
 
 
     def forward(self, x, return_attn=False):
-        """
-        x: (B, T, D)
-        """
-        B, T, _ = x.size()
-
-        # ---- QKV ----
+        
         q = self.q(x).view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         k = self.k(x).view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
         v = self.v(x).view(B, T, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
-        # ---- Attention ----
         attn_logits = torch.matmul(q, k.transpose(-2, -1)) * self.scale
         attn = F.softmax(attn_logits, dim=-1)
         self.last_attn = attn.detach().cpu()
 
         out = torch.matmul(attn, v)  # (B, H, T, d)
 
-        # ---- Kernel positions ----
         center = self.max_kernel // 2
         pos = torch.arange(self.max_kernel, device=x.device).float()
         pos = (pos - center).abs()  # (K,)
@@ -123,9 +110,7 @@ class LOP_Adaptive(nn.Module):
                 )
 
             r = torch.clamp(r, 0.0, float(self.max_radius))
-
-
-            # Gaussian soft mask (GOOD GRADIENT)
+            
             mask = torch.exp(- (pos - r) ** 2 / (2 * self.sigma ** 2))
             mask = mask.view(1, 1, -1)
 
